@@ -113,7 +113,11 @@ enum SidebarRemoteErrorCopySupport {
 }
 
 func sidebarSelectedWorkspaceBackgroundNSColor(for colorScheme: ColorScheme) -> NSColor {
-    cmuxAccentNSColor(for: colorScheme)
+    if let hex = UserDefaults.standard.string(forKey: "sidebarSelectionColorHex"),
+       let parsed = NSColor(hex: hex) {
+        return parsed
+    }
+    return cmuxAccentNSColor(for: colorScheme)
 }
 
 func sidebarSelectedWorkspaceForegroundNSColor(opacity: CGFloat) -> NSColor {
@@ -1565,6 +1569,7 @@ struct ContentView: View {
     @State private var isFullScreen: Bool = false
     @State private var observedWindow: NSWindow?
     @StateObject private var fullscreenControlsViewModel = TitlebarControlsViewModel()
+    @StateObject private var fileExplorerState = FileExplorerState()
     @State private var previousSelectedWorkspaceId: UUID?
     @State private var retiringWorkspaceId: UUID?
     @State private var workspaceHandoffGeneration: UInt64 = 0
@@ -2324,6 +2329,7 @@ struct ContentView: View {
     private var sidebarView: some View {
         VerticalTabsSidebar(
             updateViewModel: updateViewModel,
+            fileExplorerState: fileExplorerState,
             onSendFeedback: presentFeedbackComposer,
             selection: $sidebarSelectionState.selection,
             selectedTabIds: $selectedTabIds,
@@ -2344,7 +2350,7 @@ struct ContentView: View {
     }
 
     private var effectiveTitlebarPadding: CGFloat {
-        isMinimalMode ? 0 : titlebarPadding
+        isMinimalMode ? -titlebarPadding : titlebarPadding
     }
 
     private var terminalContent: some View {
@@ -2420,6 +2426,7 @@ struct ContentView: View {
     }
 
     @AppStorage("sidebarBlendMode") private var sidebarBlendMode = SidebarBlendModeOption.withinWindow.rawValue
+    @AppStorage("sidebarMatchTerminalBackground") private var sidebarMatchTerminalBackground = false
 
     // Background glass settings
     @AppStorage("bgGlassTintHex") private var bgGlassTintHex = "#000000"
@@ -2448,6 +2455,8 @@ struct ContentView: View {
                 )
             },
             onNewTab: { tabManager.addTab() },
+            onToggleFileExplorer: { fileExplorerState.isVisible.toggle() },
+            isFileExplorerVisible: fileExplorerState.isVisible,
             visibilityMode: .alwaysVisible
         )
     }
@@ -2505,6 +2514,15 @@ struct ContentView: View {
             Rectangle()
                 .fill(Color(nsColor: .separatorColor))
                 .frame(height: 1)
+        }
+    }
+
+    private func syncTrafficLightInset() {
+        let inset: CGFloat = (isMinimalMode && !sidebarState.isVisible) ? 80 : 0
+        for tab in tabManager.tabs {
+            if tab.bonsplitController.configuration.appearance.tabBarLeadingInset != inset {
+                tab.bonsplitController.configuration.appearance.tabBarLeadingInset = inset
+            }
         }
     }
 
@@ -2588,7 +2606,11 @@ struct ContentView: View {
 
     private var contentAndSidebarLayout: AnyView {
         let layout: AnyView
-        if sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue {
+        // When matching terminal background, use HStack so both sidebar and terminal
+        // sit directly on the window background with no intermediate layers.
+        let useWithinWindow = sidebarBlendMode == SidebarBlendModeOption.withinWindow.rawValue
+            && !sidebarMatchTerminalBackground
+        if useWithinWindow {
             // Overlay mode: terminal extends full width, sidebar on top
             // This allows withinWindow blur to see the terminal content
             layout = AnyView(
@@ -2657,6 +2679,7 @@ struct ContentView: View {
             syncSidebarSelectedWorkspaceIds()
             applyUITestSidebarSelectionIfNeeded(tabs: tabManager.tabs)
             updateTitlebarText()
+            syncTrafficLightInset()
 
             // Startup recovery (#399): if session restore or a race condition leaves the
             // view in a broken state (empty tabs, no selection, unmounted workspaces),
@@ -3075,6 +3098,11 @@ struct ContentView: View {
                 TerminalWindowPortalRegistry.scheduleExternalGeometrySynchronizeForAllWindows()
             }
             updateSidebarResizerBandState()
+            syncTrafficLightInset()
+        })
+
+        view = AnyView(view.onChange(of: isMinimalMode) { _, _ in
+            syncTrafficLightInset()
         })
 
         view = AnyView(view.onChange(of: sidebarState.persistedWidth) { newValue in
@@ -3106,11 +3134,11 @@ struct ContentView: View {
         view = AnyView(view.background(WindowAccessor { [sidebarBlendMode, bgGlassEnabled, bgGlassTintHex, bgGlassTintOpacity] window in
             window.identifier = NSUserInterfaceItemIdentifier(windowIdentifier)
             window.titlebarAppearsTransparent = true
-            // Do not make the entire background draggable; it interferes with drag gestures
-            // like sidebar tab reordering in multi-window mode.
+            // Keep window immovable; the sidebar's WindowDragHandleView handles
+            // drag-to-move via performDrag with temporary movable override.
+            // isMovableByWindowBackground=true breaks tab reordering, and
+            // isMovable=true blocks clicks on sidebar buttons in minimal mode.
             window.isMovableByWindowBackground = false
-            // Keep the window immovable by default so titlebar controls (like the folder icon)
-            // cannot accidentally initiate native window drags.
             window.isMovable = false
             window.styleMask.insert(.fullSizeContentView)
 
@@ -5002,6 +5030,8 @@ struct ContentView: View {
             return String(localized: "commandPalette.kind.browser", defaultValue: "Browser")
         case .markdown:
             return String(localized: "commandPalette.kind.markdown", defaultValue: "Markdown")
+        case .editor:
+            return String(localized: "commandPalette.kind.editor", defaultValue: "Editor")
         }
     }
 
@@ -5013,6 +5043,8 @@ struct ContentView: View {
             return ["browser", "web", "page"]
         case .markdown:
             return ["markdown", "note", "preview"]
+        case .editor:
+            return ["editor", "code", "file", "edit"]
         }
     }
 
@@ -8470,6 +8502,7 @@ private struct SidebarResizerAccessibilityModifier: ViewModifier {
 
 struct VerticalTabsSidebar: View {
     @ObservedObject var updateViewModel: UpdateViewModel
+    @ObservedObject var fileExplorerState: FileExplorerState
     let onSendFeedback: () -> Void
     @EnvironmentObject var tabManager: TabManager
     @EnvironmentObject var notificationStore: TerminalNotificationStore
@@ -8528,107 +8561,142 @@ struct VerticalTabsSidebar: View {
 
         VStack(spacing: 0) {
             GeometryReader { proxy in
-                ScrollView {
-                    VStack(spacing: 0) {
-                        // Space for traffic lights / fullscreen controls
-                        Spacer()
-                            .frame(height: trafficLightPadding)
+                let totalHeight = proxy.size.height
+                let dividerHeight: CGFloat = 8
+                let minimumExplorerHeight: CGFloat = 80
+                let maxDividerPos = totalHeight > minimumExplorerHeight + dividerHeight
+                    ? (totalHeight - minimumExplorerHeight - dividerHeight) / totalHeight
+                    : 0.5
+                let clampedPos = min(max(fileExplorerState.dividerPosition, 0.1), maxDividerPos)
+                let tabListHeight = fileExplorerState.isVisible
+                    ? totalHeight * clampedPos
+                    : totalHeight
+                let explorerHeight = max(0, totalHeight - tabListHeight - dividerHeight)
 
-                        LazyVStack(spacing: tabRowSpacing) {
-                            ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
-                                let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
-                                let contextTargetIds = tabManager.tabs.compactMap { workspace in
-                                    selectedContextIds.contains(workspace.id) ? workspace.id : nil
+                VStack(spacing: 0) {
+                    // MARK: - Tab list section
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            // Space for traffic lights / fullscreen controls
+                            Spacer()
+                                .frame(height: trafficLightPadding)
+
+                            LazyVStack(spacing: tabRowSpacing) {
+                                ForEach(Array(tabManager.tabs.enumerated()), id: \.element.id) { index, tab in
+                                    let selectedContextIds: Set<UUID> = selectedTabIds.contains(tab.id) ? selectedTabIds : [tab.id]
+                                    let contextTargetIds = tabManager.tabs.compactMap { workspace in
+                                        selectedContextIds.contains(workspace.id) ? workspace.id : nil
+                                    }
+                                    let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
+                                        contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
+                                    }
+                                    TabItemView(
+                                        tabManager: tabManager,
+                                        notificationStore: notificationStore,
+                                        tab: tab,
+                                        index: index,
+                                        isActive: tabManager.selectedTabId == tab.id,
+                                        workspaceShortcutDigit: WorkspaceShortcutMapper.digitForWorkspace(
+                                            at: index,
+                                            workspaceCount: workspaceCount
+                                        ),
+                                        workspaceShortcutModifierSymbol: workspaceNumberShortcut.modifierDisplayString,
+                                        canCloseWorkspace: canCloseWorkspace,
+                                        accessibilityWorkspaceCount: workspaceCount,
+                                        unreadCount: notificationStore.unreadCount(forTabId: tab.id),
+                                        latestNotificationText: {
+                                            guard showsSidebarNotificationMessage,
+                                                  let notification = notificationStore.latestNotification(forTabId: tab.id) else {
+                                                return nil
+                                            }
+                                            let text = notification.body.isEmpty ? notification.title : notification.body
+                                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                            return trimmed.isEmpty ? nil : trimmed
+                                        }(),
+                                        rowSpacing: tabRowSpacing,
+                                        setSelectionToTabs: { selection = .tabs },
+                                        selectedTabIds: $selectedTabIds,
+                                        lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                        showsModifierShortcutHints: modifierKeyMonitor.isModifierPressed,
+                                        dragAutoScrollController: dragAutoScrollController,
+                                        draggedTabId: $draggedTabId,
+                                        dropIndicator: $dropIndicator,
+                                        remoteContextMenuWorkspaceIds: remoteContextMenuTargets.map(\.id),
+                                        allRemoteContextMenuTargetsConnecting: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .connecting },
+                                        allRemoteContextMenuTargetsDisconnected: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .disconnected }
+                                    )
+                                    .equatable()
                                 }
-                                let remoteContextMenuTargets = tabManager.tabs.filter { workspace in
-                                    contextTargetIds.contains(workspace.id) && workspace.isRemoteWorkspace
-                                }
-                                TabItemView(
-                                    tabManager: tabManager,
-                                    notificationStore: notificationStore,
-                                    tab: tab,
-                                    index: index,
-                                    isActive: tabManager.selectedTabId == tab.id,
-                                    workspaceShortcutDigit: WorkspaceShortcutMapper.digitForWorkspace(
-                                        at: index,
-                                        workspaceCount: workspaceCount
-                                    ),
-                                    workspaceShortcutModifierSymbol: workspaceNumberShortcut.modifierDisplayString,
-                                    canCloseWorkspace: canCloseWorkspace,
-                                    accessibilityWorkspaceCount: workspaceCount,
-                                    unreadCount: notificationStore.unreadCount(forTabId: tab.id),
-                                    latestNotificationText: {
-                                        guard showsSidebarNotificationMessage,
-                                              let notification = notificationStore.latestNotification(forTabId: tab.id) else {
-                                            return nil
-                                        }
-                                        let text = notification.body.isEmpty ? notification.title : notification.body
-                                        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        return trimmed.isEmpty ? nil : trimmed
-                                    }(),
-                                    rowSpacing: tabRowSpacing,
-                                    setSelectionToTabs: { selection = .tabs },
-                                    selectedTabIds: $selectedTabIds,
-                                    lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                                    showsModifierShortcutHints: modifierKeyMonitor.isModifierPressed,
-                                    dragAutoScrollController: dragAutoScrollController,
-                                    draggedTabId: $draggedTabId,
-                                    dropIndicator: $dropIndicator,
-                                    remoteContextMenuWorkspaceIds: remoteContextMenuTargets.map(\.id),
-                                    allRemoteContextMenuTargetsConnecting: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .connecting },
-                                    allRemoteContextMenuTargetsDisconnected: !remoteContextMenuTargets.isEmpty && remoteContextMenuTargets.allSatisfy { $0.remoteConnectionState == .disconnected }
-                                )
-                                .equatable()
                             }
-                        }
-                        .padding(.vertical, 8)
+                            .padding(.vertical, 8)
 
-                        SidebarEmptyArea(
-                            rowSpacing: tabRowSpacing,
-                            selection: $selection,
-                            selectedTabIds: $selectedTabIds,
-                            lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
-                            dragAutoScrollController: dragAutoScrollController,
-                            draggedTabId: $draggedTabId,
-                            dropIndicator: $dropIndicator
+                            SidebarEmptyArea(
+                                rowSpacing: tabRowSpacing,
+                                selection: $selection,
+                                selectedTabIds: $selectedTabIds,
+                                lastSidebarSelectionIndex: $lastSidebarSelectionIndex,
+                                dragAutoScrollController: dragAutoScrollController,
+                                draggedTabId: $draggedTabId,
+                                dropIndicator: $dropIndicator
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(minHeight: tabListHeight, alignment: .top)
+                    }
+                    .frame(height: tabListHeight)
+                    .background(
+                        SidebarScrollViewResolver { scrollView in
+                            dragAutoScrollController.attach(scrollView: scrollView)
+                        }
+                        .frame(width: 0, height: 0)
+                    )
+                    .overlay(alignment: .top) {
+                        SidebarTopScrim(height: trafficLightPadding + 20)
+                            .allowsHitTesting(false)
+                    }
+                    .overlay(alignment: .top) {
+                        // Match native titlebar behavior in the sidebar top strip:
+                        // drag-to-move and double-click action (zoom/minimize).
+                        WindowDragHandleView()
+                            .frame(height: trafficLightPadding)
+                            .background(TitlebarDoubleClickMonitorView())
+                    }
+                    .overlay(alignment: .topLeading) {
+                        if isMinimalMode {
+                            HiddenTitlebarSidebarControlsView(notificationStore: notificationStore)
+                                .padding(.leading, hiddenTitlebarControlsLeadingInset)
+                                .padding(.top, 2)
+                        }
+                    }
+                    .background(Color.clear)
+                    .modifier(ClearScrollBackground())
+
+                    // MARK: - File explorer section
+                    if fileExplorerState.isVisible {
+                        FileExplorerDivider(
+                            position: $fileExplorerState.dividerPosition,
+                            totalHeight: totalHeight,
+                            minFraction: 0.1,
+                            maxFraction: maxDividerPos
                         )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                    .frame(minHeight: proxy.size.height, alignment: .top)
-                }
-                .background(
-                    SidebarScrollViewResolver { scrollView in
-                        dragAutoScrollController.attach(scrollView: scrollView)
-                    }
-                    .frame(width: 0, height: 0)
-                )
-                .overlay(alignment: .top) {
-                    SidebarTopScrim(height: trafficLightPadding + 20)
-                        .allowsHitTesting(false)
-                }
-                .overlay(alignment: .top) {
-                    // Match native titlebar behavior in the sidebar top strip:
-                    // drag-to-move and double-click action (zoom/minimize).
-                    WindowDragHandleView()
-                        .frame(height: trafficLightPadding)
-                        .background(TitlebarDoubleClickMonitorView())
-                }
-                .overlay(alignment: .topLeading) {
-                    if isMinimalMode {
-                        HiddenTitlebarSidebarControlsView(notificationStore: notificationStore)
-                            .padding(.leading, hiddenTitlebarControlsLeadingInset)
-                            .padding(.top, 2)
+
+                        FileExplorerSidebarSection(
+                            explorerState: fileExplorerState,
+                            height: explorerHeight
+                        )
                     }
                 }
-                .background(Color.clear)
-                .modifier(ClearScrollBackground())
+                .frame(height: totalHeight)
             }
-            SidebarFooter(updateViewModel: updateViewModel, onSendFeedback: onSendFeedback)
+            SidebarFooter(updateViewModel: updateViewModel, fileExplorerState: fileExplorerState, onSendFeedback: onSendFeedback)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
         .accessibilityIdentifier("Sidebar")
         .ignoresSafeArea()
         .background(SidebarBackdrop().ignoresSafeArea())
+        .overlay(alignment: .trailing) {
+            SidebarTrailingBorder()
+        }
         .background(
             WindowAccessor { window in
                 modifierKeyMonitor.setHostWindow(window)
@@ -9561,13 +9629,18 @@ private final class SidebarShortcutHintModifierMonitor: ObservableObject {
 
 private struct SidebarFooter: View {
     @ObservedObject var updateViewModel: UpdateViewModel
+    @ObservedObject var fileExplorerState: FileExplorerState
     let onSendFeedback: () -> Void
 
     var body: some View {
 #if DEBUG
-        SidebarDevFooter(updateViewModel: updateViewModel, onSendFeedback: onSendFeedback)
+        SidebarDevFooter(updateViewModel: updateViewModel, fileExplorerState: fileExplorerState, onSendFeedback: onSendFeedback)
 #else
-        SidebarFooterButtons(updateViewModel: updateViewModel, onSendFeedback: onSendFeedback)
+        SidebarFooterButtons(
+            updateViewModel: updateViewModel,
+            fileExplorerState: fileExplorerState,
+            onSendFeedback: onSendFeedback
+        )
             .padding(.leading, 6)
             .padding(.trailing, 10)
             .padding(.bottom, 6)
@@ -9577,11 +9650,27 @@ private struct SidebarFooter: View {
 
 private struct SidebarFooterButtons: View {
     @ObservedObject var updateViewModel: UpdateViewModel
+    @ObservedObject var fileExplorerState: FileExplorerState
     let onSendFeedback: () -> Void
 
     var body: some View {
         HStack(spacing: 4) {
             SidebarHelpMenuButton(onSendFeedback: onSendFeedback)
+
+            Button(action: { fileExplorerState.isVisible.toggle() }) {
+                Image(systemName: fileExplorerState.isVisible ? "folder.fill" : "folder")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(SidebarFooterIconButtonStyle())
+            .frame(width: 22, height: 22, alignment: .center)
+            .help(fileExplorerState.isVisible
+                ? String(localized: "sidebar.fileExplorer.hide", defaultValue: "Hide File Explorer")
+                : String(localized: "sidebar.fileExplorer.show", defaultValue: "Show File Explorer"))
+            .accessibilityLabel(fileExplorerState.isVisible
+                ? String(localized: "sidebar.fileExplorer.hide", defaultValue: "Hide File Explorer")
+                : String(localized: "sidebar.fileExplorer.show", defaultValue: "Show File Explorer"))
+            .accessibilityIdentifier("sidebarFooter.toggleFileExplorer")
+
             UpdatePill(model: updateViewModel)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -10709,13 +10798,14 @@ private struct SidebarFooterIconButtonStyleBody: View {
 #if DEBUG
 private struct SidebarDevFooter: View {
     @ObservedObject var updateViewModel: UpdateViewModel
+    @ObservedObject var fileExplorerState: FileExplorerState
     let onSendFeedback: () -> Void
     @AppStorage(DevBuildBannerDebugSettings.sidebarBannerVisibleKey)
     private var showSidebarDevBuildBanner = DevBuildBannerDebugSettings.defaultShowSidebarBanner
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SidebarFooterButtons(updateViewModel: updateViewModel, onSendFeedback: onSendFeedback)
+            SidebarFooterButtons(updateViewModel: updateViewModel, fileExplorerState: fileExplorerState, onSendFeedback: onSendFeedback)
             if showSidebarDevBuildBanner {
                 Text(String(localized: "debug.devBuildBanner.title", defaultValue: "THIS IS A DEV BUILD"))
                     .font(.system(size: 11, weight: .semibold))
@@ -11015,6 +11105,8 @@ private struct TabItemView: View, Equatable {
     @AppStorage("sidebarShowPullRequest") private var sidebarShowPullRequest = true
     @AppStorage(BrowserLinkOpenSettings.openSidebarPullRequestLinksInCmuxBrowserKey)
     private var openSidebarPullRequestLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenSidebarPullRequestLinksInCmuxBrowser
+    @AppStorage(BrowserLinkOpenSettings.openSidebarPortLinksInCmuxBrowserKey)
+    private var openSidebarPortLinksInCmuxBrowser = BrowserLinkOpenSettings.defaultOpenSidebarPortLinksInCmuxBrowser
     @AppStorage("sidebarShowSSH") private var sidebarShowSSH = true
     @AppStorage("sidebarShowPorts") private var sidebarShowPorts = true
     @AppStorage("sidebarShowLog") private var sidebarShowLog = true
@@ -11024,6 +11116,8 @@ private struct TabItemView: View, Equatable {
     private var sidebarHideAllDetails = SidebarWorkspaceDetailSettings.defaultHideAllDetails
     @AppStorage(SidebarActiveTabIndicatorSettings.styleKey)
     private var activeTabIndicatorStyleRaw = SidebarActiveTabIndicatorSettings.defaultStyle.rawValue
+    @AppStorage("sidebarSelectionColorHex") private var sidebarSelectionColorHex: String?
+    @AppStorage("sidebarNotificationBadgeColorHex") private var sidebarNotificationBadgeColorHex: String?
 
     var isMultiSelected: Bool {
         selectedTabIds.contains(tab.id)
@@ -11081,7 +11175,10 @@ private struct TabItemView: View, Equatable {
     }
 
     private var activeUnreadBadgeFillColor: Color {
-        usesInvertedActiveForeground ? Color.white.opacity(0.25) : cmuxAccentColor()
+        if let hex = sidebarNotificationBadgeColorHex, let nsColor = NSColor(hex: hex) {
+            return Color(nsColor: nsColor)
+        }
+        return usesInvertedActiveForeground ? Color.white.opacity(0.25) : cmuxAccentColor()
     }
 
     private var activeProgressTrackColor: Color {
@@ -11486,11 +11583,22 @@ private struct TabItemView: View, Equatable {
 
             // Ports row
             if detailVisibility.showsPorts, !tab.listeningPorts.isEmpty {
-                Text(tab.listeningPorts.map { ":\($0)" }.joined(separator: ", "))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundColor(activeSecondaryColor(0.75))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                HStack(spacing: 4) {
+                    ForEach(tab.listeningPorts, id: \.self) { port in
+                        Button(action: {
+                            openPortLink(port)
+                        }) {
+                            Text(String(localized: "sidebar.port.label", defaultValue: ":\(port)"))
+                                .underline()
+                        }
+                        .buttonStyle(.plain)
+                        .safeHelp(String(localized: "sidebar.port.openTooltip", defaultValue: "Open localhost:\(port)"))
+                    }
+                    Spacer(minLength: 0)
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(activeSecondaryColor(0.75))
+                .lineLimit(1)
             }
         }
         .animation(.easeInOut(duration: 0.2), value: tab.logEntries.count)
@@ -11815,14 +11923,21 @@ private struct TabItemView: View, Equatable {
         .disabled(!hasReadNotifications(in: targetIds))
     }
 
+    private var selectionBackgroundColor: NSColor {
+        if let hex = sidebarSelectionColorHex, let parsed = NSColor(hex: hex) {
+            return parsed
+        }
+        return cmuxAccentNSColor(for: colorScheme)
+    }
+
     private var backgroundColor: Color {
         switch activeTabIndicatorStyle {
         case .leftRail:
-            if isActive        { return Color(nsColor: sidebarSelectedWorkspaceBackgroundNSColor(for: colorScheme)) }
+            if isActive        { return Color(nsColor: selectionBackgroundColor) }
             if isMultiSelected { return cmuxAccentColor().opacity(0.25) }
             return Color.clear
         case .solidFill:
-            if isActive { return Color(nsColor: sidebarSelectedWorkspaceBackgroundNSColor(for: colorScheme)) }
+            if isActive { return Color(nsColor: selectionBackgroundColor) }
             if let custom = resolvedCustomTabColor {
                 if isMultiSelected { return custom.opacity(0.35) }
                 return custom.opacity(0.7)
@@ -12193,6 +12308,23 @@ private struct TabItemView: View, Equatable {
     private func openPullRequestLink(_ url: URL) {
         updateSelection()
         if openSidebarPullRequestLinksInCmuxBrowser {
+            if tabManager.openBrowser(
+                inWorkspace: tab.id,
+                url: url,
+                preferSplitRight: true,
+                insertAtEnd: true
+            ) == nil {
+                NSWorkspace.shared.open(url)
+            }
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openPortLink(_ port: Int) {
+        guard let url = URL(string: "http://localhost:\(port)") else { return }
+        updateSelection()
+        if openSidebarPortLinksInCmuxBrowser {
             if tabManager.openBrowser(
                 inWorkspace: tab.id,
                 url: url,
@@ -13699,7 +13831,70 @@ private struct TitlebarLeadingInsetReader: NSViewRepresentable {
     }
 }
 
+/// 1px trailing border on the sidebar, derived from the terminal chrome background
+/// using the same logic as bonsplit's TabBarColors.nsColorSeparator:
+/// dark bg → lighten RGB by 0.16 at 0.36 alpha; light bg → darken by 0.12 at 0.26 alpha.
+private struct SidebarTrailingBorder: View {
+    @AppStorage("sidebarMatchTerminalBackground") private var matchTerminalBackground = false
+    @State private var separatorColor: NSColor = chromeSeparatorColor()
+
+    var body: some View {
+        if matchTerminalBackground {
+            Rectangle()
+                .fill(Color(nsColor: separatorColor))
+                .frame(width: 1)
+                .ignoresSafeArea()
+                .onAppear {
+                    separatorColor = Self.chromeSeparatorColor()
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
+                    separatorColor = Self.chromeSeparatorColor()
+                }
+        }
+    }
+
+    /// Replicates bonsplit TabBarColors.nsColorSeparator derivation from chrome background.
+    private static func chromeSeparatorColor() -> NSColor {
+        let chrome = GhosttyBackgroundTheme.currentColor()
+        let srgb = chrome.usingColorSpace(.sRGB) ?? chrome
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        let isLight = luminance > 0.5
+        let amount: CGFloat = isLight ? -0.12 : 0.16
+        let alpha: CGFloat = isLight ? 0.26 : 0.36
+        return NSColor(
+            red: min(1.0, max(0.0, r + amount)),
+            green: min(1.0, max(0.0, g + amount)),
+            blue: min(1.0, max(0.0, b + amount)),
+            alpha: alpha
+        )
+    }
+}
+
+/// Sidebar background that uses the same technique as TitlebarLayerBackground:
+/// fully opaque layer color + layer-level opacity. This matches how the terminal's
+/// Metal surface composites its background.
+private struct SidebarTerminalBackgroundView: NSViewRepresentable {
+    let backgroundColor: NSColor
+    let opacity: CGFloat
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.wantsLayer = true
+        view.layer?.backgroundColor = backgroundColor.withAlphaComponent(1.0).cgColor
+        view.layer?.opacity = Float(opacity)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        nsView.layer?.backgroundColor = backgroundColor.withAlphaComponent(1.0).cgColor
+        nsView.layer?.opacity = Float(opacity)
+    }
+}
+
 private struct SidebarBackdrop: View {
+    @AppStorage("sidebarMatchTerminalBackground") private var matchTerminalBackground = false
     @AppStorage("sidebarTintOpacity") private var sidebarTintOpacity = SidebarTintDefaults.opacity
     @AppStorage("sidebarTintHex") private var sidebarTintHex = SidebarTintDefaults.hex
     @AppStorage("sidebarTintHexLight") private var sidebarTintHexLight: String?
@@ -13710,8 +13905,28 @@ private struct SidebarBackdrop: View {
     @AppStorage("sidebarCornerRadius") private var sidebarCornerRadius = 0.0
     @AppStorage("sidebarBlurOpacity") private var sidebarBlurOpacity = 1.0
     @Environment(\.colorScheme) private var colorScheme
+    @State private var terminalBackgroundColor: NSColor = GhosttyBackgroundTheme.currentColor()
 
     var body: some View {
+        let cornerRadius = CGFloat(max(0, sidebarCornerRadius))
+
+        if matchTerminalBackground {
+            // The terminal area has two stacked semi-transparent layers (Bonsplit chrome +
+            // Ghostty Metal background). Compute the effective composited opacity to match.
+            let alpha = CGFloat(GhosttyApp.shared.defaultBackgroundOpacity)
+            let effective = alpha >= 0.999 ? alpha : 1.0 - pow(1.0 - alpha, 2)
+            return AnyView(
+                SidebarTerminalBackgroundView(
+                    backgroundColor: GhosttyApp.shared.defaultBackgroundColor,
+                    opacity: effective
+                )
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .onReceive(NotificationCenter.default.publisher(for: .ghosttyDefaultBackgroundDidChange)) { _ in
+                    terminalBackgroundColor = GhosttyBackgroundTheme.currentColor()
+                }
+            )
+        }
+
         let materialOption = SidebarMaterialOption(rawValue: sidebarMaterial)
         let blendingMode = SidebarBlendModeOption(rawValue: sidebarBlendMode)?.mode ?? .behindWindow
         let state = SidebarStateOption(rawValue: sidebarState)?.state ?? .active
@@ -13724,33 +13939,34 @@ private struct SidebarBackdrop: View {
             return sidebarTintHex
         }()
         let tintColor = (NSColor(hex: resolvedHex) ?? NSColor(hex: sidebarTintHex) ?? .black).withAlphaComponent(sidebarTintOpacity)
-        let cornerRadius = CGFloat(max(0, sidebarCornerRadius))
         let useLiquidGlass = materialOption?.usesLiquidGlass ?? false
         let useWindowLevelGlass = useLiquidGlass && blendingMode == .behindWindow
 
-        return ZStack {
-            if let material = materialOption?.material {
-                // When using liquidGlass + behindWindow, window handles glass + tint
-                // Sidebar is fully transparent
-                if !useWindowLevelGlass {
-                    SidebarVisualEffectBackground(
-                        material: material,
-                        blendingMode: blendingMode,
-                        state: state,
-                        opacity: sidebarBlurOpacity,
-                        tintColor: tintColor,
-                        cornerRadius: cornerRadius,
-                        preferLiquidGlass: useLiquidGlass
-                    )
-                    // Tint overlay for NSVisualEffectView fallback
-                    if !useLiquidGlass {
-                        Color(nsColor: tintColor)
+        return AnyView(
+            ZStack {
+                if let material = materialOption?.material {
+                    // When using liquidGlass + behindWindow, window handles glass + tint
+                    // Sidebar is fully transparent
+                    if !useWindowLevelGlass {
+                        SidebarVisualEffectBackground(
+                            material: material,
+                            blendingMode: blendingMode,
+                            state: state,
+                            opacity: sidebarBlurOpacity,
+                            tintColor: tintColor,
+                            cornerRadius: cornerRadius,
+                            preferLiquidGlass: useLiquidGlass
+                        )
+                        // Tint overlay for NSVisualEffectView fallback
+                        if !useLiquidGlass {
+                            Color(nsColor: tintColor)
+                        }
                     }
                 }
+                // When material is none or useWindowLevelGlass, render nothing
             }
-            // When material is none or useWindowLevelGlass, render nothing
-        }
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        )
     }
 }
 
